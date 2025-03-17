@@ -1,5 +1,7 @@
 import argparse
 import sys
+
+import cv2
 import numpy as np
 import copy
 import time
@@ -8,6 +10,7 @@ import re
 import pandas as pd
 import math
 from matplotlib import pyplot as plt
+from ultralytics import YOLO
 
 def get_Region(filelist,Region_areas,alltime,fps):
     Region_list_all_i=[]
@@ -77,14 +80,6 @@ def S_i_M(i,M):#每个Region依次计算相加#yolov8m,yolov8s,yolov8n,yolov5nu
     elif i==4:
         return (0.000024 * M + 48.337254)
 
-def get_Q_list(last_T_list,Qmin,Qmax):
-    Q_list=[]
-    k=1
-    for i,t in enumerate(last_T_list):
-        Q=2 / (1+np.exp(-k * t))-1
-        Q_list.append(Q * (Qmax - Qmin) + Qmin)#Q 0.1，1
-    return Q_list
-
 def get_Q(t,Qmin,Qmax):
     k = 1
     Q = 2 / (1 + np.exp(-k * t)) - 1
@@ -116,44 +111,6 @@ def initialize_X_matrix_list1(N,fps,Region_list,Q_t):#第一个时隙要执行�
             for r in range(R):
                 if Q_matrix[f,r] > Q_t:
                     X_matrix[f, r] = i + 1  # 在本地检测
-        # 每区域每时隙至少要检测一次
-        for r in range(R):
-            if np.all(X_matrix[:, r] == -1):
-                f = int(fps / 2)
-                X_matrix[f, r] = i + 1
-        X_matrix_list.append(X_matrix)
-
-    return X_matrix_list,Q_matrix_list
-
-def initialize_X_matrix_list2(N,fps,Region_list,Q_list):#第一个时隙要执行的初始化算法
-    Q_matrix_list = []
-    # 得到Q
-    for i in range(N):
-        R = len(Region_list[i])
-        Q_matrix = np.full((fps, R), 0)
-        for r, region_dict in enumerate(Region_list[i]):
-            pre_flag = -1
-            for f, flag in region_dict.items():
-                if pre_flag != -1:
-                    Q = abs(flag - pre_flag) / pre_flag  # 检测的重要性程度
-                    Q_matrix[f, r] = Q
-                pre_flag = flag
-        Q_matrix_list.append(Q_matrix)
-
-    X_matrix_list = []
-    # 每个设备尽量在本地处理
-    for i in range(N):
-        R = len(Region_list[i])
-        X_matrix = np.full((fps, R), -1)
-        for r, region_dict in enumerate(Region_list[i]):
-            Q = Q_list[i]
-            pre_flag = -1
-            for f, flag in region_dict.items():
-                if pre_flag == -1:
-                    pre_flag = flag
-                elif flag - pre_flag > Q * pre_flag:  # 需要重检测
-                    X_matrix[f, r] = i + 1  # 在本地检测
-                    pre_flag = flag
         # 每区域每时隙至少要检测一次
         for r in range(R):
             if np.all(X_matrix[:, r] == -1):
@@ -219,10 +176,6 @@ def get_max_T_t(T_inference,T_transmission):
     T = [a + b for a, b in zip(T_inference, T_transmission)]
     return max(T)
 
-def get_T_t(T_inference,T_transmission):
-    T = [a + b for a, b in zip(T_inference, T_transmission)]
-    return sum(T)/len(T)
-
 def workload_banlance_K(N,fps,X_matrix_list,Region_areas):#每个设备上的数据负载，有能耗上的考虑
     K=[0 for _ in range(N)]#每个设备要检测的面积
     for i in range(N):
@@ -261,23 +214,6 @@ def goal(X_matrix_list):#目标函数
 
     return Query_Time_Front*(T_t - T_max)-V*(A_t-w*K_t)
 
-def get_need_offload(X_matrix_list):
-    need_offload=[]
-    detect_area = [0 for _ in range(N)]  # 每个设备要检测的面积
-    for i in range(N):
-        X_matrix = X_matrix_list[i]
-        i_areas = Region_areas[i]
-        for f in range(1, fps):
-            for r in range(X_matrix.shape[1]):
-                j = X_matrix[f, r] - 1
-                if j + 1 != -1:
-                    detect_area[j] += i_areas[r]
-    average_area = sum(detect_area) / N
-    for i in range(N):
-        if detect_area[i] > average_area:
-            need_offload.append(i+1)
-    return need_offload
-
 def setrandom1(X_matrix_list_old):
     X_matrix_list = copy.deepcopy(X_matrix_list_old)
 
@@ -299,37 +235,14 @@ def setrandom1(X_matrix_list_old):
     X_matrix[random_f, random_r] = random_j
     return X_matrix_list  # 返回副本
 
-def setrandom2(X_matrix_list,need_offload):
-    X_matrix_list_copy = X_matrix_list.copy()  # 创建 X_matrix 的副本
-
-    random_i = random.choice(need_offload)
-    while np.all(X_matrix_list_copy[random_i-1]== -1) :
-        random_i = random.choice(need_offload)
-
-    X_matrix = X_matrix_list_copy[random_i-1]
-
-    random_f = np.random.randint(1, X_matrix.shape[0])  # 每时隙的第一帧不参与卸载
-    random_r = np.random.randint(0, X_matrix.shape[1])
-    while X_matrix[random_f, random_r] == -1:
-        random_f = np.random.randint(1, X_matrix.shape[0])
-        random_r = np.random.randint(0, X_matrix.shape[1])
-
-    random_j = np.random.randint(1, len(X_matrix_list_copy) + 1)  # 需要保证有效更新
-    while random_j==X_matrix[random_f, random_r]:#X_matrix[random_f, random_r]
-        random_j = np.random.randint(1, len(X_matrix_list_copy) + 1)  # 需要保证有效更新
-    X_matrix[random_f, random_r] = random_j
-    return X_matrix_list_copy  # 返回副本
-
 def Markov_optimization(X_matrix_list_old,tau, iterations=100):#tau=0.05,0.1
     X_matrix_list = copy.deepcopy(X_matrix_list_old) # 保存原始列表
-    #need_offload = get_need_offload(X_matrix_list)
     no_improvement_count = 0
     # 计算目标函数值
     g = goal(X_matrix_list)
     g_list = [g]
 
     while iterations > 0:
-        #new_X_matrix_list= setrandom2(X_matrix_list,need_offload)  # 随机调整列表中一个矩阵
         new_X_matrix_list = setrandom1(X_matrix_list)
         g_hat = goal(new_X_matrix_list)  # 新列表的目标函数值
         # 计算接受新解的概率 ,当(g_hat - g) / tau为正数时，eta无限趋向于0或者为0，当(g_hat - g) / tau为0时，eta为0.5
@@ -343,7 +256,6 @@ def Markov_optimization(X_matrix_list_old,tau, iterations=100):#tau=0.05,0.1
         if g_hat<g and np.random.rand() < eta:
             X_matrix_list = new_X_matrix_list  # 更新列表
             g = g_hat
-            #need_offload = get_need_offload(X_matrix_list)
 
         g_list.append(g)
         # 停止条件
@@ -354,6 +266,308 @@ def Markov_optimization(X_matrix_list_old,tau, iterations=100):#tau=0.05,0.1
         iterations -= 1
 
     return X_matrix_list,g_list  # 返回原始列表和最终列表
+
+####
+def non_max_suppression(boxes, sortby="conf" ,iou_threshold=0.2):
+    if len(boxes) == 0:
+        return []
+
+    # 提取所有框的 [x1, y1, x2, y2] 和置信度 conf
+    coords = np.array([box[0] for box in boxes])  # [x1, y1, x2, y2]
+    scores = np.array([box[2] for box in boxes])  # conf
+
+    # 计算每个框的面积
+    areas = (coords[:, 2] - coords[:, 0] + 1) * (coords[:, 3] - coords[:, 1] + 1)
+    if sortby == "conf":
+        # 按置信度降序排序
+        order = scores.argsort()[::-1]
+    elif sortby == "area":
+        # 按面积大小降序排序
+        order = areas.argsort()[::-1]
+
+    keep = []  # 保存保留下来的框索引
+
+    while order.size > 0:
+        i = order[0]  # 当前置信度最高的框索引
+        keep.append(i)
+
+        # 计算当前框与剩余框的交并比(IOU)
+        xx1 = np.maximum(coords[i, 0], coords[order[1:], 0])  # 左上角x的最大值
+        yy1 = np.maximum(coords[i, 1], coords[order[1:], 1])  # 左上角y的最大值
+        xx2 = np.minimum(coords[i, 2], coords[order[1:], 2])  # 右下角x的最小值
+        yy2 = np.minimum(coords[i, 3], coords[order[1:], 3])  # 右下角y的最小值
+
+        # 计算交集面积
+        w = np.maximum(0, xx2 - xx1 + 1)
+        h = np.maximum(0, yy2 - yy1 + 1)
+        inter = w * h
+
+        # 计算交并比(IOU)
+        #iou = inter / (areas[i] + areas[order[1:]] - inter)
+
+        # 保留IOU小于阈值的框
+        #inds = np.where(iou <= iou_threshold)[0]
+        inds = np.where(inter ==0)[0]
+        order = order[inds + 1]
+
+    # 根据保留下来的索引返回框
+    return [boxes[i] for i in keep]
+
+def filter_boxes(track_boxes, track_regions):
+    filtered_boxes = []
+    for box in track_boxes:
+        [x1, y1, x2, y2],[cx,cy,w,h] ,conf, cls = box
+        for region in track_regions:
+            rx1, ry1, rx2, ry2 = region
+            if rx1<=cx<=rx2 and ry1<=cy<=ry2:#中心点在这个区域
+                filtered_boxes.append(box)
+            """# 计算框和区域的交集
+            intersect_x1 = max(x1, rx1)
+            intersect_y1 = max(y1, ry1)
+            intersect_x2 = min(x2, rx2)
+            intersect_y2 = min(y2, ry2)
+            # 检查交集是否为有效框
+            if intersect_x1 < intersect_x2 and intersect_y1 < intersect_y2:
+                # 添加交集框到结果列表
+                cx=int((intersect_x1+intersect_x2)/2)
+                cy=int((intersect_y1+intersect_y2)/2)
+                w=intersect_x2-intersect_x1
+                h=intersect_y2-intersect_y1
+                filtered_boxes.append([[intersect_x1, intersect_y1, intersect_x2, intersect_y2],[cx,cy,w,h] ,conf, cls])
+                """
+    return filtered_boxes
+
+def yolov8l_frame(frame):
+    model = YOLO('../model/yolov8l.pt')
+    size = 1280
+    # 设置输入图像大小
+    model.overrides["imgsz"] = size  # 必须是32的整数倍
+    results = model(frame)
+    # 获取边界框信息
+    boxes = results[0].boxes  # 批处理的原因
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)  # 获取边界框坐标
+    xywh = boxes.xywh.cpu().numpy().astype(int)
+    conf = boxes.conf.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    detect_class = [0, 1, 2, 3, 5, 7]
+    detections = [[a, b, c, d] for a, b, c, d in zip(xyxy, xywh, conf, cls) if d in detect_class]
+    return detections
+
+def yolov8m_roi(frame,roi):
+    model = YOLO('../model/yolov8m.pt')
+    roi_img = frame[roi[1]:roi[3], roi[0]:roi[2]]
+    w = roi[2] - roi[0]
+    h = roi[3] - roi[1]
+    size = 32 * math.ceil(max(w, h) / 32.0)
+    # 设置输入图像大小
+    model.overrides["imgsz"] = size  # 必须是32的整数倍
+    results = model(roi_img)  # , conf=0.4
+    # 获取边界框信息
+    boxes = results[0].boxes  # 批处理的原因
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)  # 获取边界框坐标
+    xywh = boxes.xywh.cpu().numpy().astype(int)
+    conf = boxes.conf.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    detect_class = [0, 1, 2, 3, 5, 7]
+    detections = [[a, b, c, d] for a, b, c, d in zip(xyxy, xywh, conf, cls) if d in detect_class]
+    for detection in detections:
+        # 坐标变换
+        detection[0][0] += roi[0]
+        detection[0][1] += roi[1]
+        detection[0][2] += roi[0]
+        detection[0][3] += roi[1]
+        detection[1][0] += roi[0]
+        detection[1][1] += roi[1]
+    return detections
+
+def yolov8s_roi(frame,roi):
+    model = YOLO('../model/yolov8s.pt')
+    roi_img = frame[roi[1]:roi[3], roi[0]:roi[2]]
+    w = roi[2] - roi[0]
+    h = roi[3] - roi[1]
+    size = 32 * math.ceil(max(w, h) / 32.0)
+    # 设置输入图像大小
+    model.overrides["imgsz"] = size  # 必须是32的整数倍
+    results = model(roi_img)  # , conf=0.4
+    # 获取边界框信息
+    boxes = results[0].boxes  # 批处理的原因
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)  # 获取边界框坐标
+    xywh = boxes.xywh.cpu().numpy().astype(int)
+    conf = boxes.conf.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    detect_class = [0, 1, 2, 3, 5, 7]
+    detections = [[a, b, c, d] for a, b, c, d in zip(xyxy, xywh, conf, cls) if d in detect_class]
+    for detection in detections:
+        # 坐标变换
+        detection[0][0] += roi[0]
+        detection[0][1] += roi[1]
+        detection[0][2] += roi[0]
+        detection[0][3] += roi[1]
+        detection[1][0] += roi[0]
+        detection[1][1] += roi[1]
+    return detections
+
+def yolov8n_roi(frame,roi):#roi位置坐标[x1,y1,x2,y2]
+    model = YOLO('../model/yolov8n.pt')
+    roi_img = frame[roi[1]:roi[3], roi[0]:roi[2]]
+    w = roi[2] - roi[0]
+    h = roi[3] - roi[1]
+    size = 32 * math.ceil(max(w, h) / 32.0)
+    # 设置输入图像大小
+    model.overrides["imgsz"] = size  # 必须是32的整数倍
+    results = model(roi_img)#, conf=0.4
+    # 获取边界框信息
+    boxes = results[0].boxes  # 批处理的原因
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)  # 获取边界框坐标
+    xywh = boxes.xywh.cpu().numpy().astype(int)
+    conf = boxes.conf.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    detect_class=[0,1,2,3,5,7]
+    detections = [[a, b, c, d] for a, b, c, d in zip(xyxy, xywh, conf, cls) if d in detect_class]
+    for detection in detections:
+        # 坐标变换
+        detection[0][0] += roi[0]
+        detection[0][1] += roi[1]
+        detection[0][2] += roi[0]
+        detection[0][3] += roi[1]
+        detection[1][0] += roi[0]
+        detection[1][1] += roi[1]
+    return detections
+
+def yolov5nu_roi(frame,roi):#roi位置坐标[x1,y1,x2,y2]
+    # 初始化YOLOv8模型
+    model = YOLO('../model/yolov5nu.pt')
+    roi_img = frame[roi[1]:roi[3], roi[0]:roi[2]]
+    w = roi[2] - roi[0]
+    h = roi[3] - roi[1]
+    size = 32 * math.ceil(max(w, h) / 32.0)
+    # 设置输入图像大小
+    model.overrides["imgsz"] = size  # 必须是32的整数倍
+    results = model(roi_img)#, conf=0.4
+    # 获取边界框信息
+    boxes = results[0].boxes  # 批处理的原因
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)  # 获取边界框坐标
+    xywh = boxes.xywh.cpu().numpy().astype(int)
+    conf = boxes.conf.cpu().numpy()
+    cls = boxes.cls.cpu().numpy().astype(int)
+    detect_class=[0,1,2,3,5,7]
+    detections = [[a, b, c, d] for a, b, c, d in zip(xyxy, xywh, conf, cls) if d in detect_class]
+    for detection in detections:
+        # 坐标变换
+        detection[0][0] += roi[0]
+        detection[0][1] += roi[1]
+        detection[0][2] += roi[0]
+        detection[0][3] += roi[1]
+        detection[1][0] += roi[0]
+        detection[1][1] += roi[1]
+    return detections
+
+def run(camera_path_list,regions_list,width,height,fps,label_path_list,X_matrix_list,time):
+    start_frame=time*fps
+    end_frame=(time+1)*fps
+    for v,camera_path in enumerate(camera_path_list):
+        X_matrix=X_matrix_list[v]
+        regions=regions_list[v]
+        cap = cv2.VideoCapture(camera_path)
+        # 检查视频是否成功打开
+        if not cap.isOpened():
+            print("无法打开视频")
+            return
+        # 设置起始帧
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        # 初始化变量
+        prev_gray = None
+        prev_boxes = []  # [x1, y1, x2, y2],[cx,cy,w,h] , conf, cls = box,维护这个列表展示每帧的检测结果
+        p0 = None
+        frame_count = start_frame  # 用于计数帧数
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret or frame_count >= end_frame:
+                break  # 读取失败或超过结束帧
+
+            # 转换为灰度图
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            if frame_count % fps == 0:
+                detections = yolov8l_frame(frame)
+                # 绘制检测到的边界框与点
+                for i, box in enumerate(detections):
+                    [x1, y1, x2, y2], [cx, cy, w, h], conf, cls = box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(frame, (int((x1 + x2) / 2), int((y1 + y2) / 2)), 5, color[i % len(color)].tolist(),
+                               -1)
+                # 更新
+                prev_gray = gray
+                prev_boxes = detections
+                p0 = np.array([((box[0][0] + box[0][2]) / 2, (box[0][1] + box[0][3]) / 2) for box in prev_boxes],
+                              dtype=np.float32)
+
+            else:
+                track_boxes = []  # 记录跟踪成功的点,然后和检测结果做匹配
+                if len(p0) != 0:
+                    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None, **lk_params)
+                    for i, (old, new) in enumerate(zip(p0, p1)):
+                        if st[i] == 1:
+                            a, b = new.ravel().astype(int)
+                            w = prev_boxes[i][1][2]
+                            h = prev_boxes[i][1][3]
+                            # 更新位置
+                            prev_boxes[i][1][0] = a
+                            prev_boxes[i][1][1] = b
+                            prev_boxes[i][0][0] = max(0, int(a - w / 2))
+                            prev_boxes[i][0][1] = max(0, int(b - h / 2))
+                            prev_boxes[i][0][2] = min(width, int(a + w / 2))
+                            prev_boxes[i][0][3] = min(height, int(b + h / 2))
+                            track_boxes.append(prev_boxes[i])
+
+                track_regions = []
+                detections = []  # 本地设备使用 #yolov8m,yolov8s,yolov8n,yolov5nu
+                for idx, (x, y, w, h) in enumerate(regions):
+                    y2 = y + h
+                    padding_ratio1 = (y / height) * 0.5
+                    padding_ratio2 = (y2 / height) * 0.5
+
+                    new_y1 = max(0, int(y - padding_ratio1 * h))
+                    new_y2 = min(height, int(y2 + padding_ratio2 * h))
+                    roi = [x, new_y1, x + w, new_y2]
+
+                    if X_matrix[frame_count % fps][idx] == -1:
+                        track_regions.append([x, y, x + w, y + h])
+                    elif X_matrix[frame_count % fps][idx] == 1:
+                        region_results = yolov8m_roi(frame, roi)
+                        detections.extend(region_results)
+                    elif X_matrix[frame_count % fps][idx] == 2:
+                        region_results = yolov8s_roi(frame, roi)
+                        detections.extend(region_results)
+                    elif X_matrix[frame_count % fps][idx] == 3:
+                        region_results = yolov8n_roi(frame, roi)
+                        detections.extend(region_results)
+                    elif X_matrix[frame_count % fps][idx] == 4:
+                        region_results = yolov5nu_roi(frame, roi)
+                        detections.extend(region_results)
+
+                detections = non_max_suppression(detections, "area")  # 先按照面积合并
+                track_boxes = filter_boxes(track_boxes, track_regions)  # 只保留交集到达一定程度的框
+                detections.extend(track_boxes)
+                detections = non_max_suppression(detections, "area")
+                prev_gray = gray
+                prev_boxes = detections
+                p0 = np.array([[(box[0][0] + box[0][2]) / 2, (box[0][1] + box[0][3]) / 2] for box in prev_boxes],
+                              dtype=np.float32)
+
+            # 每帧的检测框写入文件
+            with open(label_path_list[v] + "frame" + str(frame_count) + ".txt",
+                      'w') as f2:  # [x1, y1, x2, y2],[cx,cy,w,h] , conf, cls = box
+                for box in prev_boxes:
+                    f2.write(str(box[3]) + ' ' + str(box[2]) + ' ' + (
+                        ' '.join(map(str, box[1]))) + '\n')  # cls,conf,cx,cy,w,h"""
+            frame_count += 1  # 增加帧计数器
+
+        cap.release()
+
+    return
+####
 
 if __name__ == '__main__':
     """parser = argparse.ArgumentParser(description="控制参数")
@@ -425,10 +639,27 @@ if __name__ == '__main__':
     T_t_list=[]
     last_sum_T_list=[0 for _ in range(N)]
 
+    ####
+    lk_params = dict(winSize=(21, 21), maxLevel=3,  # 增加窗口大小和金字塔层数，适应快速运动
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+    color = np.random.randint(0, 255, (100, 3))
+    vdo1region = [[280, 0, 350, 200], [150, 200, 550, 220], [0, 420, 735, 300], [920, 282, 360, 179],
+                  [756, 461, 425, 259]]
+    vdo2region = [[618, 240, 123, 37], [500, 277, 297, 58], [280, 335, 329, 130], [678, 335, 285, 130],
+                  [0, 465, 575, 255], [696, 465, 583, 255]]
+    vdo3region = [[560, 222, 160, 45], [310, 267, 320, 124], [660, 267, 307, 124], [0, 391, 580, 173],
+                  [690, 391, 589, 173], [0, 564, 545, 156], [720, 564, 559, 156]]
+    vdo4region = [[668, 0, 259, 102], [520, 102, 560, 195], [350, 297, 880, 195], [150, 492, 1130, 227]]
+    vdopath = ["../traffic/vdo1/vdo1.mp4", "../traffic/vdo2/vdo2.mp4", "../traffic/vdo3/vdo3.mp4",
+               "../traffic/vdo4/vdo4.mp4"]
+    vdoregion = [vdo1region, vdo2region, vdo3region, vdo4region]
+    label_path = ["../experiment/vdo1label/", "../experiment/vdo2label/", "../experiment/vdo3label/",
+                  "../experiment/vdo4label/"]
+    ####
+
     with open("../experiment/Q_list", "w") as f:
         pass
     with open("../experiment/scheduler11.txt", "w") as file:
-    #with open("../experiment/scheduler2.txt", "a") as file:
         for t in range(alltime):
             if t == 0:
                 Query_Time_Front = 0  # q(0)=0
@@ -441,7 +672,6 @@ if __name__ == '__main__':
             Q_list.append(Q)
             #Q=0.1
             with open("../experiment/Q_list", "a") as f:
-                #f.write(' '.join(map(str, Q_list)) + '\n')
                 f.write(str(Q) + '\n')
             X_matrix_list,Q_matrix_list = initialize_X_matrix_list1(N, fps, Region_list,Q)
             bandwidth_matrix = bandwidth_matrix_all[t]  # 每时隙的带宽信息(N+1)*(N+1)
@@ -449,6 +679,7 @@ if __name__ == '__main__':
             original_K.append(K_old)
 
             best_X_matrix_list, g_list = Markov_optimization(X_matrix_list,tau)
+            run(vdopath, vdoregion, 1280, 720, 25,label_path,best_X_matrix_list,t)
 
             """with open(file2, "a") as f2:
                 f2.write(str(g_list) + '\n')"""
@@ -470,31 +701,16 @@ if __name__ == '__main__':
             for i, e in enumerate(energy):
                 energys[i] += e
             Query_Time_Back = max(Query_Time_Front + T_t - T_max, 0)  # q (t + 1) = [q (t) + (Tt − Tmax)]+
-        #file.write(f"V:{V}\n")
-        #file.write(f"w:{w}\n")
-        #file.write(f"q(t):{q_list}\n")
-        file.write(f"original_K:{original_K}\n")
+        file.write(f"a_list:{a_list}\n")
+        file.write(f"T_t_list:{T_t_list}\n")
+        file.write(f"energys:{energys}\n")
         file.write(f"new_K:{new_K}\n")
-        file.write(f"q_list:{q_list}\n")
-        file.write(f"Q_list:{Q_list}\n")
-
+        file.write(f"workloads:{workloads}\n")
     end_time = time.time()
     elapsed_time = end_time - start_time
     print(f"Elapsed time: {elapsed_time:.4f} seconds")
 
     slots = np.arange(0, alltime)
-
-    # 绘制折线图
-    #plt.figure(figsize=(12, 6))
-    plt.plot(slots, original_K, label='original_K', color='b')
-    plt.plot(slots, new_K, label='new_K', color='y')
-    #plt.title('Load balancing changes',fontsize=15)
-    plt.xlabel('Slots',fontsize=15)
-    plt.ylabel('Load balancing index K',fontsize=15)
-    plt.xticks(np.arange(0, 180, 10))
-    plt.legend(fontsize=15)
-    plt.savefig('D:\Desktop\Figures_pdf\ twoK.pdf', format='pdf')
-    plt.show()
 
     fig, ax1 = plt.subplots()
     ax1.plot(slots, q_list,  color='b',label="q(t)")
@@ -510,6 +726,4 @@ if __name__ == '__main__':
     ax1.legend(loc='upper left', fontsize=15)  # Legend for ax1
     ax2.legend(loc='upper right', fontsize=15)  # Legend for ax2
     # 设置标题
-    #plt.title("q(t) and Q threshold per slot", fontsize=15)
-    plt.savefig('D:\Desktop\Figures_pdf\qQ.pdf', format='pdf')
     plt.show()
